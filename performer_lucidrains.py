@@ -12,7 +12,7 @@ from einops import rearrange, repeat
 from functools import partial
 from contextlib import contextmanager
 
-from local_attention import LocalAttention
+#from local_attention import LocalAttention
 #from axial_positional_embedding import AxialPositionalEmbedding
 #from performer_pytorch.reversible import ReversibleSequence, SequentialSequence
 
@@ -127,9 +127,9 @@ def generalized_kernel(data, *, projection_matrix, kernel_fn = nn.ReLU(), kernel
 
   
 def orthogonal_matrix_chunk(cols, device = None):
-  '''
-  This code won't work unless torch >= 1.8
-  '''
+    '''
+    This code won't work unless torch >= 1.8
+    '''
     unstructured_block = torch.randn((cols, cols), device = device)
    
     q, r = torch.linalg.qr(unstructured_block.cpu(), mode = 'reduced')
@@ -391,8 +391,8 @@ class Attention(nn.Module):
         self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
 
         self.heads = heads
-        self.global_heads = heads - local_heads
-        self.local_attn = LocalAttention(window_size = local_window_size, causal = causal, autopad = True, dropout = dropout, look_forward = int(not causal), rel_pos_emb_config = (dim_head, local_heads)) if local_heads > 0 else None
+
+        #self.local_attn = LocalAttention(window_size = local_window_size, causal = causal, autopad = True, dropout = dropout, look_forward = int(not causal), rel_pos_emb_config = (dim_head, local_heads)) if local_heads > 0 else None
 
         self.to_q = nn.Linear(dim, inner_dim, bias = qkv_bias)
         self.to_k = nn.Linear(dim, inner_dim, bias = qkv_bias)
@@ -400,46 +400,54 @@ class Attention(nn.Module):
         self.to_out = nn.Linear(inner_dim, dim, bias = attn_out_bias)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, pos_emb = None, context = None, mask = None, context_mask = None, **kwargs):
-        b, n, _, h, gh = *x.shape, self.heads, self.global_heads
+    def forward(self, queries, keys, values, pos_emb = None, attn_mask = None, rpe=None,  **kwargs):
+        b, n, _ = queries.shape 
+        h = self.heads
 
-        cross_attend = exists(context)
-
-        context = default(context, x)
-        context_mask = default(context_mask, mask) if not cross_attend else context_mask
-
-        q, k, v = self.to_q(x), self.to_k(context), self.to_v(context)
+        q, k, v = self.to_q(queries), self.to_k(keys), self.to_v(values)
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
-        (q, lq), (k, lk), (v, lv) = map(lambda t: (t[:, :gh], t[:, gh:]), (q, k, v))
+        tgt_len = k.shape[1]
 
-        attn_outs = []
-
-        if not empty(q):
-            if exists(context_mask):
-                global_mask = context_mask[:, None, :, None]
-                v.masked_fill_(~global_mask, 0.)
-
-            if exists(pos_emb) and not cross_attend:
-                q, k = apply_rotary_pos_emb(q, k, pos_emb)
-
+        if pos_emb is not None: 
+            q, k = apply_rotary_pos_emb(q, k, pos_emb)
+# TODO: ADD OTHER POSITIONAL ENCODINGS
+        if rpe is None:
             out = self.fast_attention(q, k, v)
-            attn_outs.append(out)
 
-        if not empty(lq):
-            assert not cross_attend, 'local attention is not compatible with cross attention'
-            out = self.local_attn(lq, lk, lv, input_mask = mask)
-            attn_outs.append(out)
+            out = rearrange(out, 'b h n d -> b n (h d)')
+            out =  self.to_out(out)
 
-        out = torch.cat(attn_outs, dim = 1)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        out =  self.to_out(out)
+        else:
+            # Compute the KV matrix
+            kv = torch.einsum("nhdl,nlhm->nhmdl", k, v)
+        
+        # Efficient matrix multiplication
+            u = torch.fft.rfft(rpe, dim=-1)             #rpe.shape = [num_heads, 2*tgt_len]
+        
+            y = torch.fft.rfft(kv, n=2*tgt_len, dim=-1) #KV.shape  = [bsz, num_heads, v_dim, k_dim, tgt_len]            
+            y = torch.einsum("hl,nhmdl->nhmdl", u, y)
+            weighted_kv = torch.fft.irfft(y, dim=-1)[:, :,:,:,tgt_len:]
+
+            y1= torch.fft.rfft(k, n=2*tgt_len, dim=-1) #k.shape  = [bsz, num_heads, k_dim, tgt_len]
+            y1 = torch.einsum("hl,nhdl->nhdl", u, y1)
+            weighted_k = torch.fft.irfft(y1 ,dim=-1)[:, :,:,tgt_len:]
+    
+        # Compute the normalizer
+            Z = 1/(torch.einsum("nlhd,nhdl->nlh", q, weighted_k) + self.eps)
+    
+        # Finally compute and return the new values
+        # Equivalent to V = torch.einsum("nlhd,nhmdl,nhl->nlhm", Q, weighted_KV, Z)
+            out = torch.einsum("nlhd,nhmdl,nhl->nlhm", q, weighted_kv, Z)
+            out = rearrange(out, 'b h n d -> b n (h d)')
+            out =  self.to_out(out)
+        
         return self.dropout(out)
 
 class SelfAttention(Attention):
-    def forward(self, *args, context = None, **kwargs):
-        assert not exists(context), 'self attention should not receive context'
-        return super().forward(*args, **kwargs)
+    def forward(self, *args,  **kwargs):
+
+        return super().forward(queries, queries, queries, **kwargs)
 
 
 
@@ -485,6 +493,9 @@ class FixedPositionalEmbedding(nn.Module):
 
 # performer
 
+
+
+# TODO FIX THIS 
 class Performer(nn.Module):
     def __init__(
         self,
@@ -492,8 +503,8 @@ class Performer(nn.Module):
         depth,
         heads,
         dim_head,
-        local_attn_heads = 0,
-        local_window_size = 256,
+       # local_attn_heads = 0,
+      #  local_window_size = 256,
         causal = False,
         ff_mult = 4,
         nb_features = None,
@@ -516,10 +527,10 @@ class Performer(nn.Module):
     ):
         super().__init__()
         layers = nn.ModuleList([])
-        local_attn_heads = cast_tuple(local_attn_heads)
-        local_attn_heads = local_attn_heads * depth if len(local_attn_heads) == 1 else local_attn_heads
-        assert len(local_attn_heads) == depth, 'tuple specifying number of local attention heads per depth must be equal to the total depth'
-        assert all(map(lambda n: n >= 0 and n <= heads, local_attn_heads)), 'local attention head value must be less than the total number of heads'
+        #local_attn_heads = cast_tuple(local_attn_heads)
+       # local_attn_heads = local_attn_heads * depth if len(local_attn_heads) == 1 else local_attn_heads
+       # assert len(local_attn_heads) == depth, 'tuple specifying number of local attention heads per depth must be equal to the total depth'
+      #  assert all(map(lambda n: n >= 0 and n <= heads, local_attn_heads)), 'local attention head value must be less than the total number of heads'
 
         if use_scalenorm:
             wrapper_fn = partial(PreScaleNorm, dim)
@@ -540,8 +551,6 @@ class Performer(nn.Module):
             attn, ff = map(wrapper_fn, (attn, ff))
             layers.append(nn.ModuleList([attn, ff]))
 
-            if not cross_attend:
-                continue
 
             layers.append(nn.ModuleList([
                 wrapper_fn(CrossAttention(dim, heads = heads, dim_head = dim_head, nb_features = nb_features, generalized_attention = generalized_attention, kernel_fn = kernel_fn, dropout = attn_dropout, no_projection = no_projection, qkv_bias = qkv_bias, attn_out_bias = attn_out_bias)),
@@ -660,5 +669,8 @@ class PerformerLM(nn.Module):
 
         return x @ self.token_emb.weight.t()
       
- class PerformerEncoder():
-  pass
+ class PerformerBlock():
+    pass
+
+class PerformerEncoder():
+    pass
