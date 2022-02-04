@@ -11,6 +11,7 @@ from einops import rearrange, repeat
 
 from functools import partial
 from contextlib import contextmanager
+from spe_pytorch import *
 
 #from local_attention import LocalAttention
 #from axial_positional_embedding import AxialPositionalEmbedding
@@ -447,11 +448,6 @@ class Attention(nn.Module):
         
         return self.dropout(out)
 
-class SelfAttention(Attention):
-    def forward(self, *args,  **kwargs):
-
-        return super().forward(queries, queries, queries, **kwargs)
-
 
 
 # positional embeddings
@@ -498,91 +494,117 @@ class FixedPositionalEmbedding(nn.Module):
 
 
 
-# # TODO FIX THIS 
-# class Performer(nn.Module):
-#     def __init__(
-#         self,
-#         dim,
-#         depth,
-#         heads,
-#         dim_head,
-#        # local_attn_heads = 0,
-#       #  local_window_size = 256,
-#         causal = False,
-#         ff_mult = 4,
-#         nb_features = None,
-#         feature_redraw_interval = 1000,
-#         reversible = False,
-#         ff_chunks = 1,
-#         generalized_attention = False,
-#         kernel_fn = nn.ReLU(),
-#         use_scalenorm = False,
-#         use_rezero = False,
-#         ff_glu = False,
-#         ff_dropout = 0.,
-#         attn_dropout = 0.,
-#         cross_attend = False,
-#         no_projection = False,
-#         auto_check_redraw = True,
-#         qkv_bias = True,
-#         attn_out_bias = True,
-#         shift_tokens = False
-#     ):
-#         super().__init__()
-#         layers = nn.ModuleList([])
-#         #local_attn_heads = cast_tuple(local_attn_heads)
-#        # local_attn_heads = local_attn_heads * depth if len(local_attn_heads) == 1 else local_attn_heads
-#        # assert len(local_attn_heads) == depth, 'tuple specifying number of local attention heads per depth must be equal to the total depth'
-#       #  assert all(map(lambda n: n >= 0 and n <= heads, local_attn_heads)), 'local attention head value must be less than the total number of heads'
+ class PerformerBlock(nn.Module):
+  def __init__(self, attention, d_model, dropout=0.1,
+                 activation="relu"):
+        super(PerformerBlock, self).__init__()
+        d_ff = 4*d_model
+        self.attention = attention
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = getattr(F, activation)
 
-#         if use_scalenorm:
-#             wrapper_fn = partial(PreScaleNorm, dim)
-#         elif use_rezero:
-#             wrapper_fn = ReZero
-#         else:
-#             wrapper_fn = partial(PreLayerNorm, dim)
+    def forward(self, x, attn_mask=None, length_mask=None, rpe=None):
+        """Apply the transformer encoder to the input x.
 
-#         for _, local_heads in zip(range(depth), local_attn_heads):
+        Arguments
+        ---------
+            x: The input features of shape (N, L, E) where N is the batch size,
+               L is the sequence length (padded) and E is d_model passed in the
+               constructor.
+            attn_mask: An implementation of fast_transformers.masking.BaseMask
+                       that encodes where each element of x can attend to.
+            length_mask: An implementation of
+                         fast_transformers.masking.BaseMask that encodes how
+                         many elements each sequence in the batch consists of.
+        """
+        # Normalize the masks
+        N = x.shape[0]
+        L = x.shape[1]
+        attn_mask = attn_mask #TODO: figure out the mask from the paper
+        length_mask = length_mask #TODO: figure out the mask from the paper
 
-#             attn = SelfAttention(dim, causal = causal, heads = heads, dim_head = dim_head, local_heads = local_heads, local_window_size = local_window_size, nb_features = nb_features, generalized_attention = generalized_attention, kernel_fn = kernel_fn, dropout = attn_dropout, no_projection = no_projection, qkv_bias = qkv_bias, attn_out_bias = attn_out_bias)
-#             ff = Chunk(ff_chunks, FeedForward(dim, mult = ff_mult, dropout = ff_dropout, glu = ff_glu), along_dim = 1)
+        # Run self attention and add it to the input
+        x = x + self.dropout(self.attention(
+            x, x, x,
+            attn_mask=attn_mask,
+            query_lengths=length_mask,
+            key_lengths=length_mask,
+            rpe=rpe
+        ))
 
-#             if shift_tokens:
-#                 shift = (0, 1) if causal else (-1, 0, 1)
-#                 attn, ff = map(lambda t: PreShiftTokens(shift, t), (attn, ff))
+        # Run the fully connected part of the layer
+        y = x = self.norm1(x)
+        y = self.dropout(self.activation(self.linear1(y)))
+        y = self.dropout(self.linear2(y))
 
-#             attn, ff = map(wrapper_fn, (attn, ff))
-#             layers.append(nn.ModuleList([attn, ff]))
+        return self.norm2(x+y)
 
 
-#             layers.append(nn.ModuleList([
-#                 wrapper_fn(CrossAttention(dim, heads = heads, dim_head = dim_head, nb_features = nb_features, generalized_attention = generalized_attention, kernel_fn = kernel_fn, dropout = attn_dropout, no_projection = no_projection, qkv_bias = qkv_bias, attn_out_bias = attn_out_bias)),
-#                 wrapper_fn(Chunk(ff_chunks, FeedForward(dim, mult = ff_mult, dropout = ff_dropout, glu = ff_glu), along_dim = 1))
-#             ]))
+class PerformerEncoder(nn.Module):
+    def __init__(self, layers, n_heads, dim, d_model, norm_layer=None, rel_pos_bins=None, spe=None, spe_type=None, kernel_size=None):
+        super(TransformerEncoder, self).__init__()
+        self.layers = nn.ModuleList(layers)
+        self.norm = norm_layer
+        self.dim = dim 
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.kernel_size = kernel_size
+        self.rel_pos_bins = rel_pos_bins #num_heads * dim
+        self.spe = spe
+        self.spe_type = spe_type
+        if self.spe is None: 
+            self.relative_positional_bias = Parameter(torch.randn(self.n_heads, 2 * rel_pos_bins - 1))
 
-#         execute_type = ReversibleSequence if reversible else SequentialSequence
+        if spe_type== 'sine':
+            self.sine_spe = SineSpe(self.n_heads, self.dim, self.d_model)
+        elif spe_type == 'conv':
+            self.conv_spe = ConvSpe(self.n_heads, self.dim, self.d_model, self.kernel_size)
+        
 
-#         route_attn = ((True, False),) * depth * (2 if cross_attend else 1)
-#         route_context = ((False, False), (True, False)) * depth
-#         attn_route_map = {'mask': route_attn, 'pos_emb': route_attn}
-#         context_route_map = {'context': route_context, 'context_mask': route_context} if cross_attend else {}
-#         self.net = execute_type(layers, args_route = {**attn_route_map, **context_route_map})
+    def forward(self, x, attn_mask=None, length_mask=None):
+        """Apply all transformer encoder layers to the input x.
 
-#         # keeping track of when to redraw projections for all attention layers
-#         self.auto_check_redraw = auto_check_redraw
-#         self.proj_updater = ProjectionUpdater(self.net, feature_redraw_interval)
+        Arguments
+        ---------
+            x: The input features of shape (N, L, E) where N is the batch size,
+               L is the sequence length (padded) and E is d_model passed in the
+               constructor of each transformer encoder layer.
+            attn_mask: 
+            length_mask: Paper explains this encodes how
+                         many elements each sequence in the batch consists of.
+        """
+        # Normalize the masks
+        N = x.shape[0]
+        L = x.shape[1]
+        if self.spe is None:
+            if L <= self.rel_pos_bins:
+                rpe = torch.cat((self.relative_positional_bias[:,0].unsqueeze(1), 
+                                self.relative_positional_bias[:,self.rel_pos_bins-L: self.rel_pos_bins+L-1]), dim=1)
+            else:
+                rpe = torch.cat((self.relative_positional_bias[:,0].unsqueeze(1).repeat(1,L-self.rel_pos_bins+1), 
+                            self.relative_positional_bias,
+                            self.relative_positional_bias[:,-1].unsqueeze(1).repeat(1,L-self.rel_pos_bins)), dim=1)
 
-#     def fix_projection_matrices_(self):
-#         self.proj_updater.feature_redraw_interval = None
+        else:   
+            if self.spe_type == 'sine':
+                rpe = self.sine_spe(x.shape[:2])
+            elif self.spe_type == 'conv':
+                rpe = self.conv_spe(x.shape[:2])
+            else:
+                raise ValueError('spe_type not supported')
 
-#     def forward(self, x, **kwargs):
-#         if self.auto_check_redraw:
-#             self.proj_updater.redraw_projections()
-#         return self.net(x, **kwargs)
+        # Apply all the transformers
+        for layer in self.layers:
+            x = layer(x, attn_mask=attn_mask, length_mask=length_mask, rpe=rpe)
 
+        # Apply the normalization if needed
+        if self.norm is not None:
+            x = self.norm(x)
 
- class PerformerBlock():
-    pass
+        return x
 
-class PerformerEncoder():
-    pass
+#TODO: FINISH ADDING ALL THE KEYWORDS AND DEBUG @arijitthegame
