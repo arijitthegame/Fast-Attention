@@ -13,10 +13,6 @@ from functools import partial
 from contextlib import contextmanager
 from spe_pytorch import *
 
-#from local_attention import LocalAttention
-#from axial_positional_embedding import AxialPositionalEmbedding
-#from performer_pytorch.reversible import ReversibleSequence, SequentialSequence
-
 # helpers
 
 def exists(val):
