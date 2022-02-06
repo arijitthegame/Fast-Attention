@@ -168,30 +168,8 @@ def linear_attention(q, k, v):
     out = torch.einsum('...de,...nd,...n->...ne', context, q, D_inv)
     return out
 
-# efficient causal linear attention, created by EPFL
-# TODO: rewrite EPFL's CUDA kernel to do mixed precision and remove half to float conversion and back
-# def causal_linear_attention(q, k, v, eps = 1e-6):
-#     from fast_transformers.causal_product import CausalDotProduct
-#     autocast_enabled = torch.is_autocast_enabled()
-#     is_half = isinstance(q, torch.cuda.HalfTensor)
-#     assert not is_half or APEX_AVAILABLE, 'half tensors can only be used if nvidia apex is available'
-#     cuda_context = null_context if not autocast_enabled else partial(autocast, enabled = False)
 
-#     causal_dot_product_fn = amp.float_function(CausalDotProduct.apply) if is_half else CausalDotProduct.apply
-
-#     k_cumsum = k.cumsum(dim=-2) + eps
-#     D_inv = 1. / torch.einsum('...nd,...nd->...n', q, k_cumsum.type_as(q))
-
-#     with cuda_context():
-#         if autocast_enabled:
-#             q, k, v = map(lambda t: t.float(), (q, k, v))
-
-#         out = causal_dot_product_fn(q, k, v)
-
-#     out = torch.einsum('...nd,...n->...nd', out, D_inv)
-#     return out
-
-# inefficient causal linear attention, without cuda code, for reader's reference
+# inefficient causal linear attention, without cuda code, for reader's reference (for debugging)
 
 def causal_linear_attention_noncuda(q, k, v, chunk_size = 128, eps = 1e-6):
     last_k_cumsum = 0
@@ -370,37 +348,62 @@ class Attention(nn.Module):
         causal = False,
         heads = 8,
         dim_head = 64,
-        local_heads = 0,
-        local_window_size = 256,
         nb_features = None,
         feature_redraw_interval = 1000,
         generalized_attention = False,
         kernel_fn = nn.ReLU(),
-        dropout = 0.,
+        dropout_prob = 0.,
         no_projection = False,
         qkv_bias = False,
-        attn_out_bias = True
+        attn_out_bias = True,
+        pos_emb = False,
+        use_spe = False,
+        use_mask_pos = False
     ):
         super().__init__()
-        assert dim % heads == 0, 'dimension must be divisible by number of heads'
-        dim_head = default(dim_head, dim // heads)
-        inner_dim = dim_head * heads
-        self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
+        
 
         self.heads = heads
+        self.dim = dim
+        self.causal = causal
+        self.dim_head = dim_head
+        self.nb_features = nb_features
+        self.feature_redraw_interval = feature_redraw_interval
+        self.generalized_attention = generalized_attention
+        self.kernel_fn = kernel_fn
+        self.dropout_prob = dropout_prob
+        self.no_projection = no_projection
+        self.qkv_bias = qkv_bias
+        self.attn_out_bias = attn_out_bias
+        self.pos_emb = pos_emb
+        self.use_spe = use_spe
+        self.use_mask_pos = use_mask_pos
 
-        #self.local_attn = LocalAttention(window_size = local_window_size, causal = causal, autopad = True, dropout = dropout, look_forward = int(not causal), rel_pos_emb_config = (dim_head, local_heads)) if local_heads > 0 else None
+        if self.use_spe:
+            self.spe = SPEFilter(gated=True, code_shape=(self.num_heads, self.dim_head)) 
+
+        self.fast_attention = FastAttention(self.dim_head, self.nb_features, causal = self.causal, generalized_attention = self.generalized_attention, kernel_fn = self.kernel_fn, no_projection = self.no_projection)
+
+        assert dim % heads == 0, 'dimension must be divisible by number of heads'
+        dim_head = default(dim_head, dim // heads)
+        inner_dim = dim_head * heads  # for all practical purposes dim == inner_dim
 
         self.to_q = nn.Linear(dim, inner_dim, bias = qkv_bias)
         self.to_k = nn.Linear(dim, inner_dim, bias = qkv_bias)
         self.to_v = nn.Linear(dim, inner_dim, bias = qkv_bias)
         self.to_out = nn.Linear(inner_dim, dim, bias = attn_out_bias)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(self.dropout_prob)
 
-    def forward(self, queries, keys, values, pos_emb = None, attn_mask = None, length_mask=None, rpe=None,  **kwargs):
+    def forward(self, queries, keys, values, pos_emb = None, attn_mask = None, length_mask=None, rpe=None,  pos_codes=None, **kwargs):
         '''
         Length mask is only used for the FFT paper. 
+        Only one of pos_codes or pos_emb or rpe should be used.
         '''
+
+        assert not (pos_codes is not None and pos_emb is not None), 'Only one of pos_codes or pos_emb should be used'
+        assert not (pos_codes is not None and rpe is not None), 'Only one of pos_codes or rpe should be used'
+        assert not (pos_emb is not None and rpe is not None), 'Only one of pos_emb or rpe should be used'
+
         b, n, _ = queries.shape 
         h = self.heads
 
@@ -411,7 +414,10 @@ class Attention(nn.Module):
 
         if pos_emb is not None: 
             q, k = apply_rotary_pos_emb(q, k, pos_emb)
-# TODO: ADD OTHER POSITIONAL ENCODINGS
+
+        if self.use_spe:
+            q, k = self.spe(q, k, pos_codes)
+
         if rpe is None:
             out = self.fast_attention(q, k, v)
 
@@ -490,10 +496,15 @@ class FixedPositionalEmbedding(nn.Module):
 
 
 
- class PerformerBlock(nn.Module):
-  def __init__(self, attention, d_model, dropout=0.1,
+class PerformerBlock(nn.Module):
+    '''
+    This is the performer SELF ATTENTION block.
+    '''
+    def __init__(self, attention, d_model, dropout=0.1,
                  activation="relu"):
         super(PerformerBlock, self).__init__()
+
+
         d_ff = 4*d_model
         self.attention = attention
         self.linear1 = nn.Linear(d_model, d_ff)
@@ -503,7 +514,7 @@ class FixedPositionalEmbedding(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = getattr(F, activation)
 
-    def forward(self, x, attn_mask=None, length_mask=None, rpe=None):
+    def forward(self, x, pos_emb = None, attn_mask = None, length_mask=None, rpe=None,  pos_codes=None, **kwargs):
         """Apply the transformer encoder to the input x.
 
         Arguments
@@ -511,25 +522,21 @@ class FixedPositionalEmbedding(nn.Module):
             x: The input features of shape (N, L, E) where N is the batch size,
                L is the sequence length (padded) and E is d_model passed in the
                constructor.
-            attn_mask: An implementation of fast_transformers.masking.BaseMask
-                       that encodes where each element of x can attend to.
-            length_mask: An implementation of
-                         fast_transformers.masking.BaseMask that encodes how
-                         many elements each sequence in the batch consists of.
+       #TODO: ADD IN THE LENGTH AND THE ATTENTION MASK
         """
         # Normalize the masks
         N = x.shape[0]
         L = x.shape[1]
-        attn_mask = attn_mask #TODO: figure out the mask from the paper
-        length_mask = length_mask #TODO: figure out the mask from the paper
 
         # Run self attention and add it to the input
         x = x + self.dropout(self.attention(
             x, x, x,
             attn_mask=attn_mask,
-            query_lengths=length_mask,
-            key_lengths=length_mask,
-            rpe=rpe
+            length_mask=length_mask,
+            rpe=rpe, 
+            pos_codes=pos_codes,
+            pos_emb=pos_emb,
+            **kwargs))
         ))
 
         # Run the fully connected part of the layer
@@ -541,8 +548,9 @@ class FixedPositionalEmbedding(nn.Module):
 
 
 class PerformerEncoder(nn.Module):
-    def __init__(self, layers, n_heads, dim, d_model, norm_layer=None, rel_pos_bins=None, spe=None, spe_type=None, kernel_size=None):
-        super(TransformerEncoder, self).__init__()
+    def __init__(self, layers, n_heads, dim, d_model, norm_layer=None, rel_pos_bins=None, spe=False, spe_type=None, kernel_size=None, pos_emb = False,
+        use_mask_pos = False):
+        super(PerformerEncoder, self).__init__()
         self.layers = nn.ModuleList(layers)
         self.norm = norm_layer
         self.dim = dim 
@@ -552,8 +560,8 @@ class PerformerEncoder(nn.Module):
         self.rel_pos_bins = rel_pos_bins #num_heads * dim
         self.spe = spe
         self.spe_type = spe_type
-        if self.spe is None: 
-            self.relative_positional_bias = Parameter(torch.randn(self.n_heads, 2 * rel_pos_bins - 1))
+        if self.spe and self.pos_emb is False: 
+            self.relative_positional_bias = nn.Parameter(torch.randn(self.n_heads, 2 * rel_pos_bins - 1))
 
         if spe_type== 'sine':
             self.sine_spe = SineSpe(self.n_heads, self.dim, self.d_model)
