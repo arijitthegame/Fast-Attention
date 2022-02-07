@@ -356,7 +356,7 @@ class Attention(nn.Module):
         no_projection = False,
         qkv_bias = False,
         attn_out_bias = True,
-        pos_emb = False,
+        use_rot__emb = False,
         use_spe = False,
         use_mask_pos = False
     ):
@@ -364,7 +364,7 @@ class Attention(nn.Module):
         
 
         self.heads = heads
-        self.dim = dim
+        self.dim = dim #check
         self.causal = causal
         self.dim_head = dim_head
         self.nb_features = nb_features
@@ -375,7 +375,7 @@ class Attention(nn.Module):
         self.no_projection = no_projection
         self.qkv_bias = qkv_bias
         self.attn_out_bias = attn_out_bias
-        self.pos_emb = pos_emb
+        self.use_rot_emb = use_rot_emb
         self.use_spe = use_spe
         self.use_mask_pos = use_mask_pos
 
@@ -394,15 +394,11 @@ class Attention(nn.Module):
         self.to_out = nn.Linear(inner_dim, dim, bias = attn_out_bias)
         self.dropout = nn.Dropout(self.dropout_prob)
 
-    def forward(self, queries, keys, values, pos_emb = None, attn_mask = None, length_mask=None, rpe=None,  pos_codes=None, **kwargs):
+    def forward(self, queries, keys, values, attn_mask = None, length_mask=None, rpe=None, **kwargs):
         '''
         Length mask is only used for the FFT paper. 
-        Only one of pos_codes or pos_emb or rpe should be used.
+        Must provide rpe if using spe or rot emb or mask pos.
         '''
-
-        assert not (pos_codes is not None and pos_emb is not None), 'Only one of pos_codes or pos_emb should be used'
-        assert not (pos_codes is not None and rpe is not None), 'Only one of pos_codes or rpe should be used'
-        assert not (pos_emb is not None and rpe is not None), 'Only one of pos_emb or rpe should be used'
 
         b, n, _ = queries.shape 
         h = self.heads
@@ -412,19 +408,14 @@ class Attention(nn.Module):
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
         tgt_len = k.shape[1]
 
-        if pos_emb is not None: 
-            q, k = apply_rotary_pos_emb(q, k, pos_emb)
+        if self.use_rot_emb is True: 
+            q, k = apply_rotary_pos_emb(q, k, rpe)
 
         if self.use_spe:
-            q, k = self.spe(q, k, pos_codes)
+            q, k = self.spe(q, k, rpe)
 
-        if rpe is None:
-            out = self.fast_attention(q, k, v)
 
-            out = rearrange(out, 'b h n d -> b n (h d)')
-            out =  self.to_out(out)
-
-        else:
+        if self.use_mask_pos:
             # Compute the KV matrix
             kv = torch.einsum("nhdl,nlhm->nhmdl", k, v)
         
@@ -445,6 +436,11 @@ class Attention(nn.Module):
         # Finally compute and return the new values
         # Equivalent to V = torch.einsum("nlhd,nhmdl,nhl->nlhm", Q, weighted_KV, Z)
             out = torch.einsum("nlhd,nhmdl,nhl->nlhm", q, weighted_kv, Z)
+            out = rearrange(out, 'b h n d -> b n (h d)')
+            out =  self.to_out(out)
+
+        else:
+            out = self.fast_attention(q, k, v)
             out = rearrange(out, 'b h n d -> b n (h d)')
             out =  self.to_out(out)
         
@@ -514,7 +510,7 @@ class PerformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = getattr(F, activation)
 
-    def forward(self, x, pos_emb = None, attn_mask = None, length_mask=None, rpe=None,  pos_codes=None, **kwargs):
+    def forward(self, x, attn_mask = None, length_mask=None, rpe=None, **kwargs):
         """Apply the transformer encoder to the input x.
 
         Arguments
@@ -534,10 +530,7 @@ class PerformerBlock(nn.Module):
             attn_mask=attn_mask,
             length_mask=length_mask,
             rpe=rpe, 
-            pos_codes=pos_codes,
-            pos_emb=pos_emb,
             **kwargs))
-        ))
 
         # Run the fully connected part of the layer
         y = x = self.norm1(x)
@@ -548,7 +541,7 @@ class PerformerBlock(nn.Module):
 
 
 class PerformerEncoder(nn.Module):
-    def __init__(self, layers, n_heads, dim, d_model, norm_layer=None, rel_pos_bins=None, spe=False, spe_type=None, kernel_size=None, pos_emb = False,
+    def __init__(self, layers, n_heads, dim, d_model, norm_layer=None, rel_pos_bins=None, use_spe=False, spe_type=None, kernel_size=None, use_rot_emb = False,
         use_mask_pos = False):
         super(PerformerEncoder, self).__init__()
         self.layers = nn.ModuleList(layers)
@@ -560,7 +553,9 @@ class PerformerEncoder(nn.Module):
         self.rel_pos_bins = rel_pos_bins #num_heads * dim
         self.spe = spe
         self.spe_type = spe_type
-        if self.spe and self.pos_emb is False: 
+        self.pos_emb = pos_emb
+        self.use_mask_pos = use_mask_pos
+        if (self.use_spe and self.use_rot_emb) is False: 
             self.relative_positional_bias = nn.Parameter(torch.randn(self.n_heads, 2 * rel_pos_bins - 1))
 
         if spe_type== 'sine':
@@ -569,7 +564,7 @@ class PerformerEncoder(nn.Module):
             self.conv_spe = ConvSpe(self.n_heads, self.dim, self.d_model, self.kernel_size)
         
 
-    def forward(self, x, attn_mask=None, length_mask=None):
+    def forward(self, x, attn_mask = None, length_mask=None, rpe=None, **kwargs):
         """Apply all transformer encoder layers to the input x.
 
         Arguments
@@ -584,7 +579,7 @@ class PerformerEncoder(nn.Module):
         # Normalize the masks
         N = x.shape[0]
         L = x.shape[1]
-        if self.spe is None:
+        if (self.use_spe and self.use_rot_emb) is False:
             if L <= self.rel_pos_bins:
                 rpe = torch.cat((self.relative_positional_bias[:,0].unsqueeze(1), 
                                 self.relative_positional_bias[:,self.rel_pos_bins-L: self.rel_pos_bins+L-1]), dim=1)
@@ -593,13 +588,17 @@ class PerformerEncoder(nn.Module):
                             self.relative_positional_bias,
                             self.relative_positional_bias[:,-1].unsqueeze(1).repeat(1,L-self.rel_pos_bins)), dim=1)
 
-        else:   
+        elif self.use_spe is True:   
             if self.spe_type == 'sine':
                 rpe = self.sine_spe(x.shape[:2])
             elif self.spe_type == 'conv':
                 rpe = self.conv_spe(x.shape[:2])
             else:
                 raise ValueError('spe_type not supported')
+        else: 
+            
+         # we assume that L is the max seq length
+            rpe = FixedPositionalEmbedding(self.dim, L)
 
         # Apply all the transformers
         for layer in self.layers:
@@ -611,4 +610,4 @@ class PerformerEncoder(nn.Module):
 
         return x
 
-#TODO: FINISH ADDING ALL THE KEYWORDS AND DEBUG @arijitthegame
+#TODO: FINISH DEBUG @arijitthegame
