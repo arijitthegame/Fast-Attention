@@ -572,7 +572,7 @@ class PerformerEncoder(nn.Module):
         self.norm = norm_layer
         self.dim = dim #dim per head
         self.n_heads = n_heads
-        self.d_model = d_model
+        self.d_model = d_model #d_ model = dim per head * n_heads
         self.kernel_size = kernel_size
         self.num_realizations = num_realizations
         self.max_seq_length = max_seq_length
@@ -590,11 +590,12 @@ class PerformerEncoder(nn.Module):
             self.conv_spe = ConvSPE(self.n_heads, self.dim, self.d_model, self.kernel_size)
 
         if self.use_rot_emb is True: 
-          self.pos_emb = FixedPositionalEmbedding(self.dim, self.max_seq_length)
-          #layerwise positional embeddings missing here.
+          self.pos_emb = FixedPositionalEmbedding(self.d_model, self.max_seq_length)
+          self.layer_pos_emb = FixedPositionalEmbedding(self.dim, self.max_seq_length)
+          
         
 
-    def forward(self, x, attn_mask = None, length_mask=None, rpe=None, **kwargs):
+    def forward(self, x, rpe=None, **kwargs):
         """Apply all transformer encoder layers to the input x.
 
         Arguments
@@ -631,7 +632,8 @@ class PerformerEncoder(nn.Module):
                 raise ValueError('spe_type not supported')
         else:   
          # we assume that L is the max seq length
-            rpe = self.pos_emb(x)
+            x += self.pos_emb(x) #check behavior is as expected
+            rpe = self.layer_pos_emb(x)
 
         # Apply all the transformers
         for layer in self.layers:
