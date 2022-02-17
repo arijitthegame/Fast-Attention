@@ -11,7 +11,7 @@ from einops import rearrange, repeat
 
 from functools import partial
 from contextlib import contextmanager
-from spe_pytorch import *
+
 
 # helpers
 
@@ -345,6 +345,7 @@ class Attention(nn.Module):
     def __init__(
         self,
         dim,
+        max_seq_length,
         causal = False,
         heads = 8,
         dim_head = 64,
@@ -356,15 +357,17 @@ class Attention(nn.Module):
         no_projection = False,
         qkv_bias = False,
         attn_out_bias = True,
-        use_rot__emb = False,
+        use_rot_emb = False,
         use_spe = False,
-        use_mask_pos = False
+        use_mask_pos = False,
+        eps = 1e-6
+       
     ):
         super().__init__()
         
 
         self.heads = heads
-        self.dim = dim #check
+        self.dim = dim #output_dim
         self.causal = causal
         self.dim_head = dim_head
         self.nb_features = nb_features
@@ -378,9 +381,11 @@ class Attention(nn.Module):
         self.use_rot_emb = use_rot_emb
         self.use_spe = use_spe
         self.use_mask_pos = use_mask_pos
+        self.max_seq_length = max_seq_length
+        self.eps = eps #for numerical stability
 
         if self.use_spe:
-            self.spe = SPEFilter(gated=True, code_shape=(self.num_heads, self.dim_head)) 
+            self.spe = SPEFilter(gated=True, code_shape=(self.heads, self.dim_head)) 
 
         self.fast_attention = FastAttention(self.dim_head, self.nb_features, causal = self.causal, generalized_attention = self.generalized_attention, kernel_fn = self.kernel_fn, no_projection = self.no_projection)
 
@@ -394,9 +399,8 @@ class Attention(nn.Module):
         self.to_out = nn.Linear(inner_dim, dim, bias = attn_out_bias)
         self.dropout = nn.Dropout(self.dropout_prob)
 
-    def forward(self, queries, keys, values, attn_mask = None, length_mask=None, rpe=None, **kwargs):
-        '''
-        Length mask is only used for the FFT paper. 
+    def forward(self, queries, keys, values, rpe=None, **kwargs):
+        ''' 
         Must provide rpe if using spe or rot emb or mask pos.
         '''
 
@@ -404,19 +408,26 @@ class Attention(nn.Module):
         h = self.heads
 
         q, k, v = self.to_q(queries), self.to_k(keys), self.to_v(values)
-
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
         tgt_len = k.shape[1]
+ 
 
         if self.use_rot_emb is True: 
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
             q, k = apply_rotary_pos_emb(q, k, rpe)
 
-        if self.use_spe:
+        if self.use_spe is True:
+            q, k = map(lambda t: rearrange(t, 'b n (h d) -> b n h d', h = h), (q, k))
             q, k = self.spe(q, k, rpe)
+            v = rearrange(v, 'b n (h d) -> b h n d', h = h)
+            q, k = map(lambda t: rearrange(t, 'b h n d -> b n h d'), (q, k))
+          
 
 
         if self.use_mask_pos:
             # Compute the KV matrix
+            k = rearrange(k, 'b n (h d) -> b h d n', h = h) 
+            v = rearrange(v,'b n (h d) -> b n h d', h = h)
+            q = rearrange(q, 'b n (h d) -> b n h d', h = h)
             kv = torch.einsum("nhdl,nlhm->nhmdl", k, v)
         
         # Efficient matrix multiplication
@@ -432,11 +443,12 @@ class Attention(nn.Module):
     
         # Compute the normalizer
             Z = 1/(torch.einsum("nlhd,nhdl->nlh", q, weighted_k) + self.eps)
+            Z = rearrange(Z, 'n l h -> n h l') #transpose by keeping the batch dim fixed
     
         # Finally compute and return the new values
         # Equivalent to V = torch.einsum("nlhd,nhmdl,nhl->nlhm", Q, weighted_KV, Z)
             out = torch.einsum("nlhd,nhmdl,nhl->nlhm", q, weighted_kv, Z)
-            out = rearrange(out, 'b h n d -> b n (h d)')
+            out = rearrange(out, 'b n h d -> b n (h d)')
             out =  self.to_out(out)
 
         else:
@@ -510,7 +522,7 @@ class PerformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.activation = getattr(F, activation)
 
-    def forward(self, x, attn_mask = None, length_mask=None, rpe=None, **kwargs):
+    def forward(self, x, rpe=None, **kwargs):
         """Apply the transformer encoder to the input x.
 
         Arguments
@@ -518,7 +530,7 @@ class PerformerBlock(nn.Module):
             x: The input features of shape (N, L, E) where N is the batch size,
                L is the sequence length (padded) and E is d_model passed in the
                constructor.
-       #TODO: ADD IN THE LENGTH AND THE ATTENTION MASK
+       
         """
         # Normalize the masks
         N = x.shape[0]
@@ -527,8 +539,6 @@ class PerformerBlock(nn.Module):
         # Run self attention and add it to the input
         x = x + self.dropout(self.attention(
             x, x, x,
-            attn_mask=attn_mask,
-            length_mask=length_mask,
             rpe=rpe, 
             **kwargs))
 
@@ -541,27 +551,46 @@ class PerformerBlock(nn.Module):
 
 
 class PerformerEncoder(nn.Module):
-    def __init__(self, layers, n_heads, dim, d_model, norm_layer=None, rel_pos_bins=None, use_spe=False, spe_type=None, kernel_size=None, use_rot_emb = False,
-        use_mask_pos = False):
+    def __init__(self, 
+        layers, 
+        n_heads, 
+        dim, 
+        d_model, 
+        max_seq_length,
+        num_realizations=1,
+        norm_layer=None, 
+        rel_pos_bins=None, 
+        use_spe=False, 
+        spe_type=None, 
+        kernel_size=None, 
+        use_rot_emb = False,
+        use_mask_pos = False, 
+        ):
+
         super(PerformerEncoder, self).__init__()
         self.layers = nn.ModuleList(layers)
         self.norm = norm_layer
-        self.dim = dim 
+        self.dim = dim #dim per head
         self.n_heads = n_heads
         self.d_model = d_model
         self.kernel_size = kernel_size
+        self.num_realizations = num_realizations
+        self.max_seq_length = max_seq_length
         self.rel_pos_bins = rel_pos_bins #num_heads * dim
-        self.spe = spe
-        self.spe_type = spe_type
-        self.pos_emb = pos_emb
-        self.use_mask_pos = use_mask_pos
-        if (self.use_spe and self.use_rot_emb) is False: 
+        self.use_rot_emb = use_rot_emb #use rotary positional embeddings in Rotoformer
+        self.use_spe = use_spe #gated mechanism for positional embeddings using conv or sine 
+        self.spe_type = spe_type #conv/sine spe
+        self.use_mask_pos = use_mask_pos #fft masking via Toeplitz matrices
+        if self.use_mask_pos is True: 
             self.relative_positional_bias = nn.Parameter(torch.randn(self.n_heads, 2 * rel_pos_bins - 1))
 
-        if spe_type== 'sine':
-            self.sine_spe = SineSpe(self.n_heads, self.dim, self.d_model)
-        elif spe_type == 'conv':
-            self.conv_spe = ConvSpe(self.n_heads, self.dim, self.d_model, self.kernel_size)
+        if self.spe_type== 'sine':
+            self.sine_spe = SineSPE(num_heads=self.n_heads, in_features=self.dim, num_sines=self.d_model, num_realizations=self.num_realizations)
+        elif self.spe_type == 'conv':
+            self.conv_spe = ConvSPE(self.n_heads, self.dim, self.d_model, self.kernel_size)
+
+        if self.use_rot_emb is True: 
+          self.pos_emb = FixedPositionalEmbedding(self.dim, self.max_seq_length)
         
 
     def forward(self, x, attn_mask = None, length_mask=None, rpe=None, **kwargs):
@@ -579,7 +608,11 @@ class PerformerEncoder(nn.Module):
         # Normalize the masks
         N = x.shape[0]
         L = x.shape[1]
-        if (self.use_spe and self.use_rot_emb) is False:
+    
+        # We assume that the sequences have the right length and nothing is padded. 
+        #TODO: ADD in attention mask if there is a PAD token 
+
+        if self.use_mask_pos is True:
             if L <= self.rel_pos_bins:
                 rpe = torch.cat((self.relative_positional_bias[:,0].unsqueeze(1), 
                                 self.relative_positional_bias[:,self.rel_pos_bins-L: self.rel_pos_bins+L-1]), dim=1)
@@ -590,19 +623,18 @@ class PerformerEncoder(nn.Module):
 
         elif self.use_spe is True:   
             if self.spe_type == 'sine':
-                rpe = self.sine_spe(x.shape[:2])
+                rpe = self.sine_spe((self.n_heads, self.max_seq_length))
             elif self.spe_type == 'conv':
-                rpe = self.conv_spe(x.shape[:2])
+                rpe = self.conv_spe(self.n_heads, self.dim)
             else:
                 raise ValueError('spe_type not supported')
-        else: 
-            
+        else:   
          # we assume that L is the max seq length
-            rpe = FixedPositionalEmbedding(self.dim, L)
+            rpe = self.pos_emb(x)
 
         # Apply all the transformers
         for layer in self.layers:
-            x = layer(x, attn_mask=attn_mask, length_mask=length_mask, rpe=rpe)
+            x = layer(x, rpe=rpe)
 
         # Apply the normalization if needed
         if self.norm is not None:
