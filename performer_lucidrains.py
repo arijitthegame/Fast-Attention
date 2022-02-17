@@ -428,26 +428,26 @@ class Attention(nn.Module):
             k = rearrange(k, 'b n (h d) -> b h d n', h = h) 
             v = rearrange(v,'b n (h d) -> b n h d', h = h)
             q = rearrange(q, 'b n (h d) -> b n h d', h = h)
-            kv = torch.einsum("nhdl,nlhm->nhmdl", k, v)
+            kv = torch.einsum("bhdn,bnhm->bhmdn", k, v)
         
         # Efficient matrix multiplication
             u = torch.fft.rfft(rpe, dim=-1)             #rpe.shape = [num_heads, 2*tgt_len]
         
             y = torch.fft.rfft(kv, n=2*tgt_len, dim=-1) #KV.shape  = [bsz, num_heads, v_dim, k_dim, tgt_len]            
-            y = torch.einsum("hl,nhmdl->nhmdl", u, y)
+            y = torch.einsum("hn,bhmdl->bhmdn", u, y)
             weighted_kv = torch.fft.irfft(y, dim=-1)[:, :,:,:,tgt_len:]
 
             y1= torch.fft.rfft(k, n=2*tgt_len, dim=-1) #k.shape  = [bsz, num_heads, k_dim, tgt_len]
-            y1 = torch.einsum("hl,nhdl->nhdl", u, y1)
+            y1 = torch.einsum("hn,bhdn->bhdn", u, y1)
             weighted_k = torch.fft.irfft(y1 ,dim=-1)[:, :,:,tgt_len:]
     
         # Compute the normalizer
             Z = 1/(torch.einsum("nlhd,nhdl->nlh", q, weighted_k) + self.eps)
-            Z = rearrange(Z, 'n l h -> n h l') #transpose by keeping the batch dim fixed
+            Z = rearrange(Z, 'b n h -> b h n') #transpose by keeping the batch dim fixed
     
         # Finally compute and return the new values
-        # Equivalent to V = torch.einsum("nlhd,nhmdl,nhl->nlhm", Q, weighted_KV, Z)
-            out = torch.einsum("nlhd,nhmdl,nhl->nlhm", q, weighted_kv, Z)
+            # key_dim = query_dim = value_dim
+            out = torch.einsum("bnhd,bhddn,bhn->bnhd", q, weighted_kv, Z)
             out = rearrange(out, 'b n h d -> b n (h d)')
             out =  self.to_out(out)
 
@@ -591,6 +591,7 @@ class PerformerEncoder(nn.Module):
 
         if self.use_rot_emb is True: 
           self.pos_emb = FixedPositionalEmbedding(self.dim, self.max_seq_length)
+          #layerwise positional embeddings missing here.
         
 
     def forward(self, x, attn_mask = None, length_mask=None, rpe=None, **kwargs):
@@ -624,7 +625,7 @@ class PerformerEncoder(nn.Module):
         elif self.use_spe is True:   
             if self.spe_type == 'sine':
                 rpe = self.sine_spe((self.n_heads, self.max_seq_length))
-            elif self.spe_type == 'conv':
+            elif self.spe_type == 'conv':  #conv gives poor results
                 rpe = self.conv_spe(self.n_heads, self.dim)
             else:
                 raise ValueError('spe_type not supported')
@@ -642,4 +643,5 @@ class PerformerEncoder(nn.Module):
 
         return x
 
-#TODO: FINISH DEBUG @arijitthegame
+#TODO: Add some unit tests to show usage. @author: arijitthegame
+#TODO: Add attention mask for LM experiments.
