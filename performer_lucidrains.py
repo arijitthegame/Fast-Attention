@@ -1,5 +1,12 @@
 '''
-Almost verbatim code from Lucidrains
+Almost verbatim code from Lucidrains. With the added RPE from the 
+SPE paper and the FFT based Toeplitz matrix multiplication from the fast scalable attention paper.
+
+To use the performer with various mechanisms, you need to set the following parameters:
+In Attention class, set dim = heads * dim_head 
+In Performer block, set dim = dim as above
+And in PerformerEncoder class, n_heads=heads,dim=dim_head (from before),
+d_model=n_heads*dim_head, num_realizations=dim_head,rel_pos_bins=n_heads*dim_head
 '''
 
 import math
@@ -424,7 +431,8 @@ class Attention(nn.Module):
 
 
         if self.use_mask_pos:
-            # Compute the KV matrix
+            # Compute the KV matrix #computing and storing a lot of intermediate tensors 
+            #TODO: make this more efficient
             k = rearrange(k, 'b n (h d) -> b h d n', h = h) 
             v = rearrange(v,'b n (h d) -> b n h d', h = h)
             q = rearrange(q, 'b n (h d) -> b n h d', h = h)
@@ -603,9 +611,7 @@ class PerformerEncoder(nn.Module):
             x: The input features of shape (N, L, E) where N is the batch size,
                L is the sequence length (padded) and E is d_model passed in the
                constructor of each transformer encoder layer.
-            attn_mask: 
-            length_mask: Paper explains this encodes how
-                         many elements each sequence in the batch consists of.
+            attn_mask: not compute attention for [PAD] tokens. #TODO: add this to the transformer encoder
         """
         # Normalize the masks
         N = x.shape[0]
@@ -632,7 +638,7 @@ class PerformerEncoder(nn.Module):
                 raise ValueError('spe_type not supported')
         else:   
          # we assume that L is the max seq length
-            x += self.pos_emb(x) #check behavior is as expected
+            x += self.pos_emb(x)
             rpe = self.layer_pos_emb(x)
 
         # Apply all the transformers
