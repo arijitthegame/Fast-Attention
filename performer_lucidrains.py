@@ -356,7 +356,7 @@ class Attention(nn.Module):
         causal = False,
         heads = 8,
         dim_head = 64,
-        nb_features = None,
+        nb_features = 16,
         feature_redraw_interval = 1000,
         generalized_attention = False,
         kernel_fn = nn.ReLU(),
@@ -395,7 +395,9 @@ class Attention(nn.Module):
             self.spe = SPEFilter(gated=True, code_shape=(self.heads, self.dim_head)) 
 
         self.fast_attention = FastAttention(self.dim_head, self.nb_features, causal = self.causal, generalized_attention = self.generalized_attention, kernel_fn = self.kernel_fn, no_projection = self.no_projection)
-
+        if self.use_mask_pos:
+            self.create_projection = partial(gaussian_orthogonal_random_matrix, nb_rows = self.nb_features, nb_columns = self.dim_head)
+            self.projection_matrix = self.create_projection()
         assert dim % heads == 0, 'dimension must be divisible by number of heads'
         dim_head = default(dim_head, dim // heads)
         inner_dim = dim_head * heads  # for all practical purposes dim == inner_dim
@@ -433,9 +435,15 @@ class Attention(nn.Module):
         if self.use_mask_pos:
             # Compute the KV matrix #computing and storing a lot of intermediate tensors 
             #TODO: make this more efficient
-            k = rearrange(k, 'b n (h d) -> b h d n', h = h) 
-            v = rearrange(v,'b n (h d) -> b n h d', h = h)
-            q = rearrange(q, 'b n (h d) -> b n h d', h = h)
+            create_kernel = partial(softmax_kernel, projection_matrix = self.projection_matrix, device = q.device)
+            q, k = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k))
+            q = create_kernel(q, is_query = True)
+            k = create_kernel(k, is_query = False)
+           
+            # Compute the KV matrix
+            k = rearrange(k, 'b h n d -> b h d n', h = h) 
+            v = rearrange(v,'b n (h d) -> b n h d', h = h) 
+            q = rearrange(q, 'b h n d -> b n h d', h=h)
             kv = torch.einsum("bhdn,bnhm->bhmdn", k, v)
         
         # Efficient matrix multiplication
