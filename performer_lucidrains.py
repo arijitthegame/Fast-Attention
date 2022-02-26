@@ -367,7 +367,8 @@ class Attention(nn.Module):
         use_rot_emb = False,
         use_spe = False,
         use_mask_pos = False,
-        eps = 1e-6
+        eps = 1e-6, 
+        normalize = False
        
     ):
         super().__init__()
@@ -390,6 +391,7 @@ class Attention(nn.Module):
         self.use_mask_pos = use_mask_pos
         self.max_seq_length = max_seq_length
         self.eps = eps #for numerical stability
+        self.normalize = normalize
 
         if self.use_spe:
             self.spe = SPEFilter(gated=True, code_shape=(self.heads, self.dim_head)) 
@@ -437,6 +439,9 @@ class Attention(nn.Module):
             #TODO: make this more efficient
             create_kernel = partial(softmax_kernel, projection_matrix = self.projection_matrix, device = q.device)
             q, k = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k))
+            if self.normalize: 
+                q = q/(q.norm(dim=-1, keepdim=True)+ 1e-10)
+                k = k/(k.norm(dim=-1, keepdim=True) + 1e-10)
             q = create_kernel(q, is_query = True)
             k = create_kernel(k, is_query = False)
            
@@ -581,6 +586,7 @@ class PerformerEncoder(nn.Module):
         kernel_size=None, 
         use_rot_emb = False,
         use_mask_pos = False, 
+        normalize = False
         ):
 
         super(PerformerEncoder, self).__init__()
@@ -597,6 +603,7 @@ class PerformerEncoder(nn.Module):
         self.use_spe = use_spe #gated mechanism for positional embeddings using conv or sine 
         self.spe_type = spe_type #conv/sine spe
         self.use_mask_pos = use_mask_pos #fft masking via Toeplitz matrices
+        self.normalize = normalize # normalize keys/queries
         if self.use_mask_pos is True: 
             self.relative_positional_bias = nn.Parameter(torch.randn(self.n_heads, 2 * rel_pos_bins - 1))
 
