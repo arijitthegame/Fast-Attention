@@ -4,4 +4,9 @@ The Stochastic Positional Encoding comes from https://github.com/aliutkus/spe/tr
 
 Adding in the FFT from https://proceedings.neurips.cc//paper/2021/file/c0f168ce8900fa56e57789e2a2f2c9d0-Paper.pdf.
 
-For maximum confusion, there will be pytorch as well as tensorflow/jax code thrown in here to be used for various projects with different collaborators. 
+Added in 2d Toeplitz matrix masking from our work https://proceedings.mlr.press/v162/choromanski22a/choromanski22a.pdf
+For Graph related experiments using graph diffusion kernels (GKAT) in our work see https://github.com/arijitthegame/GKAT-Experiments/tree/main/arijit_refactor
+
+Note that: it is straightforward to add in the Toeplitz masking into performer_vit as well. See https://github.com/arijitthegame/Fast-Attention/blob/main/performer_lucidrains.py#L454-L473
+
+This is in active development and code is used in https://github.com/arijitthegame/enformer_performer/blob/main/enformer_refactored.py.

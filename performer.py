@@ -1,6 +1,7 @@
 '''
 Almost verbatim code from Lucidrains. With the added RPE from the 
-SPE paper and the FFT based Toeplitz matrix multiplication from the fast scalable attention paper.
+SPE paper https://arxiv.org/abs/2105.08399
+ and the FFT based Toeplitz matrix multiplication from https://proceedings.neurips.cc//paper/2021/file/c0f168ce8900fa56e57789e2a2f2c9d0-Paper.pdf.
 
 To use the performer with various mechanisms, you need to set the following parameters:
 In Attention class, set dim = heads * dim_head 
