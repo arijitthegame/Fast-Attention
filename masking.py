@@ -77,9 +77,7 @@ class BaseMask(object):
         """Same as additive_matrix but with -1e24 instead of infinity."""
         if not hasattr(self, "_additive_matrix_finite"):
             with torch.no_grad():
-                self._additive_matrix_finite = (
-                    (~self.bool_matrix).float() * (-1e24)
-                )
+                self._additive_matrix_finite = (~self.bool_matrix).float() * (-1e24)
         return self._additive_matrix_finite
 
     @property
@@ -100,9 +98,7 @@ class BaseMask(object):
                     lengths = self.lengths
                     if len(lengths.shape) == 1:
                         target = torch.arange(
-                            1,
-                            len(lengths)+1,
-                            device=lengths.device
+                            1, len(lengths) + 1, device=lengths.device
                         )
                         self._lower_triangular = torch.all(lengths == target)
                 except ValueError:
@@ -128,6 +124,7 @@ class FullMask(BaseMask):
            is not provided. If N is given M defaults to N.
         device: The device to create the mask in (defaults to cpu)
     """
+
     def __init__(self, mask=None, N=None, M=None, device="cpu"):
         # mask is a tensor so we ignore N and M
         if mask is not None and isinstance(mask, torch.Tensor):
@@ -168,6 +165,7 @@ class LengthMask(BaseMask):
         device: The device to be used for creating the masks (defaults to
                 lengths.device)
     """
+
     def __init__(self, lengths, max_len=None, device=None):
         self._device = device or lengths.device
         with torch.no_grad():
@@ -182,9 +180,7 @@ class LengthMask(BaseMask):
         if self._bool_matrix is None:
             with torch.no_grad():
                 indices = torch.arange(self._max_len, device=self._device)
-                self._bool_matrix = (
-                    indices.view(1, -1) < self._lengths.view(-1, 1)
-                )
+                self._bool_matrix = indices.view(1, -1) < self._lengths.view(-1, 1)
         return self._bool_matrix
 
 
@@ -196,8 +192,8 @@ class TriangularCausalMask(LengthMask):
         N: The size of the matrix
         device: The device to create the mask in (defaults to cpu)
     """
+
     def __init__(self, N, device="cpu"):
-        lengths = torch.arange(1, N+1, device=device)
+        lengths = torch.arange(1, N + 1, device=device)
         super(TriangularCausalMask, self).__init__(lengths, N, device)
         self._lower_triangular = True
-
