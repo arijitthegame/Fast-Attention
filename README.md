@@ -14,4 +14,4 @@ This is in active development and code is used in https://github.com/arijitthega
 Future Work: Add the HRF variant (Angular Hybrid) defined in https://openreview.net/pdf?id=EMigfE6ZeS. The current code is too slow and not properly optimized for GPU/TPU. 
 
 ########################
-Based on current results and results from https://arxiv.org/abs/2107.07999, should default to RPE. Currently out of scope : develop TPU friendly RPE aka optimize the current implementation, the main bottleneck being fft not optimized for TPUs.
+Based on ongoing work and results from our work, we should default to RPE. Currently out of scope : develop TPU friendly RPE aka optimize the current implementation, the main bottleneck being fft not optimized for TPUs.
